@@ -5,7 +5,10 @@
 #
 #   说明      运行该 tag 自己 release.yml 里的「Generate release note」脚本重新生成，
 #             与上游 SnowLuma/SnowLuma 的原文逐字一致。脚本里的 ${GITHUB_REPOSITORY}
-#             换成 link_repo（默认就是本仓库），所以提交链接、对比链接都指向你的 fork
+#             换成 link_repo（默认就是本仓库），所以提交链接、对比链接都指向你的 fork。
+#             上游发布后手改过说明的版本（v2.x 里只有 v2.0.0），把原文放在
+#             .github/release-notes/<tag>.md，优先用它，里面指向上游的
+#             对比 / 提交 / 下载链接同样换成 link_repo
 #
 #   运行包     6 个：win-x64 / linux-x64 / linux-arm64，各有完整版和 Lite。重新构建，
 #             按该 tag 的 release.yml 配方：同版本 Node 和 pnpm、--frozen-lockfile、
@@ -74,7 +77,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # 上游仓库名。上游在 /home/runner/work/SnowLuma/SnowLuma 和 D:\a\SnowLuma\SnowLuma 下构建
+  # 上游仓库。上游在 /home/runner/work/SnowLuma/SnowLuma 和 D:\a\SnowLuma\SnowLuma 下构建
+  UPSTREAM_REPO: SnowLuma/SnowLuma
   UPSTREAM_NAME: SnowLuma
   # 拉原包时依次尝试的仓库（找同名 tag 的 Release）
   SOURCE_REPOS: XingYunStar/snowluma
@@ -191,24 +195,34 @@ jobs:
           mkdir -p "$RUNNER_TEMP/notes"
           echo "说明里的链接指向 \`$LINK_REPO\`" >> "$GITHUB_STEP_SUMMARY"
           for t in $(jq -r '.[]' <<<"$TAGS"); do
-            script="$RUNNER_TEMP/gen-notes-$t.sh"
-            git show "$t:.github/workflows/release.yml" \
-              | yq '.jobs.release.steps[] | select(.name == "Generate release note") | .run' > "$script"
-            if [ ! -s "$script" ]; then
-              echo "::error::$t 的 release.yml 里没有 Generate release note 步骤，需要手工准备说明"
-              exit 1
+            manual=".github/release-notes/$t.md"
+            if [ -f "$manual" ]; then
+              # 上游手改过的说明：用仓库里存的原文，只把对比 / 提交 / 下载链接换到 link_repo
+              # （issue / PR 编号在 fork 里对不上，保持原样）
+              sed -E "s#https://github\.com/$UPSTREAM_REPO/(compare|commit|releases)/#https://github.com/$LINK_REPO/\1/#g" \
+                "$manual" > "$RUNNER_TEMP/notes/$t.md"
+              source="手工原文 $manual"
+            else
+              script="$RUNNER_TEMP/gen-notes-$t.sh"
+              git show "$t:.github/workflows/release.yml" \
+                | yq '.jobs.release.steps[] | select(.name == "Generate release note") | .run' > "$script"
+              if [ ! -s "$script" ]; then
+                echo "::error::$t 的 release.yml 里没有 Generate release note 步骤，需要手工准备说明"
+                exit 1
+              fi
+              if grep -qF '$''{{' "$script"; then
+                echo "::error::$t 的说明脚本里用了 Actions 表达式，写法和 v1.10 之后不同，需要手工处理"
+                exit 1
+              fi
+              rm -f release-notes.md
+              GITHUB_REF_NAME="$t" GITHUB_REPOSITORY="$LINK_REPO" \
+                bash --noprofile --norc -eo pipefail "$script"
+              mv release-notes.md "$RUNNER_TEMP/notes/$t.md"
+              source="release.yml 脚本重新生成"
             fi
-            if grep -qF '$''{{' "$script"; then
-              echo "::error::$t 的说明脚本里用了 Actions 表达式，写法和 v1.10 之后不同，需要手工处理"
-              exit 1
-            fi
-            rm -f release-notes.md
-            GITHUB_REF_NAME="$t" GITHUB_REPOSITORY="$LINK_REPO" \
-              bash --noprofile --norc -eo pipefail "$script"
-            mv release-notes.md "$RUNNER_TEMP/notes/$t.md"
             {
               echo
-              echo "<details><summary>$t 的说明</summary>"
+              echo "<details><summary>$t 的说明（$source）</summary>"
               echo
               cat "$RUNNER_TEMP/notes/$t.md"
               echo
