@@ -1,0 +1,724 @@
+# =============================================================================
+# Mirror Releases：在 fork 里补上 Release（说明 + 运行包 + Docker 镜像），镜像同时推到 GHCR
+# =============================================================================
+# fork 不会带上原仓库的 Release，这个工作流按 tag 重新创建：
+#
+#   说明      运行该 tag 自己 release.yml 里的「Generate release note」脚本重新生成，
+#             与上游 SnowLuma/SnowLuma 的原文逐字一致。脚本里的 ${GITHUB_REPOSITORY}
+#             换成 link_repo（默认就是本仓库），所以提交链接、对比链接都指向你的 fork
+#
+#   运行包     6 个：win-x64 / linux-x64 / linux-arm64，各有完整版和 Lite。重新构建，
+#             按该 tag 的 release.yml 配方：同版本 Node 和 pnpm、--frozen-lockfile、
+#             build:all、check:release-layout，打包命令也一样。
+#             build 任务照抄的是 RECIPE_TAG 的构建步骤；某个 tag 的构建步骤和它不同
+#             （v1.x 就不同），就不重建，改用原包
+#             另外在上游当时的路径（…/SnowLuma/SnowLuma）下构建：打包器会用文件的
+#             绝对路径给生成的 protobuf 函数起名，路径一样，名字才和原包一样
+#
+#   Docker    重新构建，按该版本发布时上游 SnowLuma.Docker.Framework 的配方：
+#             上游发版时触发的是 Docker 仓库 main 分支上的 docker-image.yml，所以取
+#             tag 发布时上游 main 上的那个提交（见 DOCKER_UPSTREAM_HEAD），
+#             把本仓库 Release 里对应架构的 Lite 包作为 SnowLuma.Framework.tar.gz 装进去，
+#             amd64 / arm64 各在原生运行器上构建。基础镜像的 Node 版本取自原镜像配置。
+#             release.yml 里没有 dispatch-docker 的版本（v1.6.35 及以前）上游没发过
+#             对应的镜像，跳过
+#             结果导出成 docker load 可直接导入的 tar 上传到 Release，并推送到 GHCR，
+#             合成一个多架构的 ghcr.io/<用户名>/snowluma:<tag>（最新版另打 latest）
+#
+#   拉原包     任何一项构建失败（或关掉 rebuild），就从 SOURCE_REPOS 同名 tag 的 Release
+#             下载原文件。Docker 原 tar 同样会推到 GHCR
+#
+# 用法：Actions → Mirror Releases → Run workflow
+#   1. mode=dry-run     只生成说明，在运行汇总里检查
+#   2. mode=full        构建并发布；可重复运行，已有 Release 的 tag 默认跳过
+#   mode=notes-only     只把已有 Release 的说明换成重新生成的原文，文件不动
+#
+# GHCR 的包第一次推送后默认是私有的，要去包的设置页面改成 Public 才能匿名拉取。
+# =============================================================================
+
+name: Mirror Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: '要处理的 tag，空格或逗号分隔'
+        default: v2.4.2
+      mode:
+        description: 'dry-run=只生成说明 / notes-only=只改已有 Release 的说明 / full=构建并发布'
+        type: choice
+        options: [dry-run, notes-only, full]
+        default: dry-run
+      rebuild:
+        description: '重新构建运行包和 Docker 镜像（关掉则全部用原包）'
+        type: boolean
+        default: true
+      push_ghcr:
+        description: '把 Docker 镜像推送到 GHCR'
+        type: boolean
+        default: true
+      skip_existing:
+        description: 'full 模式下跳过已有 Release 的 tag（关掉则覆盖说明和文件）'
+        type: boolean
+        default: true
+      link_repo:
+        description: '说明里提交 / 对比链接指向的仓库，留空 = 本仓库'
+        default: ''
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: mirror-releases
+  cancel-in-progress: false
+
+env:
+  # 上游仓库名。上游在 /home/runner/work/SnowLuma/SnowLuma 和 D:\a\SnowLuma\SnowLuma 下构建
+  UPSTREAM_NAME: SnowLuma
+  # 拉原包时依次尝试的仓库（找同名 tag 的 Release）
+  SOURCE_REPOS: XingYunStar/snowluma
+  # build 任务照抄的是这个 tag 的构建步骤，其他 tag 的构建步骤要和它一致才重建
+  RECIPE_TAG: v2.4.2
+  # Docker 构建配方所在的仓库：你 fork 的 SnowLuma.Docker.Framework
+  DOCKER_FRAMEWORK_REPO: XTFG/snowluma-docker-framework
+  # 上游 main 的最后一个提交（2026-10-13，经 Stlara-F 的 fork 合并进来）。
+  # 从它沿第一父提交往回走就是上游 main 的历史，按 tag 的发布时间在里面挑配方。
+  # 用这个办法给 v2.4.2 挑出来的就是它本身，已与原镜像核对：
+  # start.sh、supervisord.conf 逐字节相同，7 条 RUN 完全一致
+  DOCKER_UPSTREAM_HEAD: 3f388b17f8baf47b4c2c9606b8a3121eb8599fef
+  # 打 tag 到触发 Docker 构建要几分钟（v2.4.2 是 6 分多钟），挑 tag 时间往后这么多秒内
+  # 上游 main 的最后一个提交。93 个触发过 Docker 的版本里，这个窗口只对 v1.6.37 有影响，
+  # 而那次只改了 README 和工作流
+  DOCKER_DISPATCH_WINDOW: 1800
+  # GHCR 镜像名（推送前会转成小写）
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/snowluma
+
+jobs:
+  prepare:
+    name: 生成说明
+    runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.resolve.outputs.tags }}
+      latest: ${{ steps.resolve.outputs.latest }}
+      info: ${{ steps.recipe.outputs.info }}
+      docker_tags: ${{ steps.recipe.outputs.docker_tags }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LINK_REPO: ${{ inputs.link_repo || github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: 确定要处理的 tag
+        id: resolve
+        env:
+          TAGS_INPUT: ${{ inputs.tags }}
+          MODE: ${{ inputs.mode }}
+          SKIP_EXISTING: ${{ inputs.skip_existing }}
+        run: |
+          existing="$(gh release list --limit 1000 --json tagName --jq '.[].tagName')"
+          has_release() { grep -qxF -- "$1" <<<"$existing"; }
+          todo=()
+          for t in $(tr ',' ' ' <<<"$TAGS_INPUT"); do
+            if ! git rev-parse -q --verify "refs/tags/$t" >/dev/null; then
+              echo "::error::仓库里没有 tag $t"
+              exit 1
+            fi
+            if [ "$MODE" = notes-only ] && ! has_release "$t"; then
+              echo "::warning::$t 还没有 Release，notes-only 模式跳过"
+              continue
+            fi
+            if [ "$MODE" = full ] && [ "$SKIP_EXISTING" = true ] && has_release "$t"; then
+              echo "::notice::$t 已有 Release，跳过（要覆盖请关掉 skip_existing）"
+              continue
+            fi
+            todo+=("$t")
+          done
+          # 按版本排序：Release 依次创建，列表顺序才对
+          sorted="$(printf '%s\n' "${todo[@]}" | sed '/^$/d' | sort -uV)"
+          # 标为最新版的：已有 Release 和本次处理的 tag 里版本最高的正式版
+          latest="$({ printf '%s\n' "$existing"; printf '%s\n' "$sorted"; } | grep -E '^v[0-9]' | grep -v -- - | sort -V | tail -n 1 || true)"
+          # shellcheck disable=SC2086
+          echo "tags=$(jq -cn '$ARGS.positional' --args $sorted)" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "要处理：${sorted:-（无）}；最新版：${latest:-（无）}"
+
+      - name: 核对各 tag 的构建配方
+        id: recipe
+        env:
+          TAGS: ${{ steps.resolve.outputs.tags }}
+        run: |
+          # 构建任务的“配方”：矩阵 + 每一步用的 action、参数和命令（pnpm 版本单独取）
+          recipe() {
+            git show "$1:.github/workflows/release.yml" | yq -o=json -I=0 '
+              .jobs.build | {
+                "matrix": .strategy.matrix,
+                "steps": [.steps[] | {"uses": .uses, "run": .run, "with": ((.with // {}) | del(.version))}]
+              }'
+          }
+          want="$(recipe "$RECIPE_TAG")"
+          info='{}'
+          docker_tags=()
+          echo "| tag | 运行包 | Docker |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| --- | --- | --- |" >> "$GITHUB_STEP_SUMMARY"
+          for t in $(jq -r '.[]' <<<"$TAGS"); do
+            rebuild=false
+            if [ "$(recipe "$t")" = "$want" ]; then rebuild=true; fi
+            pnpm="$(git show "$t:.github/workflows/release.yml" \
+              | yq '[.jobs.build.steps[] | select(.uses // "" | test("^pnpm/action-setup")) | .with.version][0] // ""')"
+            docker=false
+            if git show "$t:.github/workflows/release.yml" | yq -e '.jobs | has("dispatch-docker")' >/dev/null; then
+              docker=true
+              docker_tags+=("$t")
+            fi
+            info="$(jq -c --arg t "$t" --argjson r "$rebuild" --argjson d "$docker" --arg p "$pnpm" \
+              --argjson time "$(git log -1 --format=%ct "$t")" \
+              '.[$t] = {rebuild: $r, docker: $d, pnpm: $p, time: $time}' <<<"$info")"
+            printf '| %s | %s | %s |\n' "$t" \
+              "$([ "$rebuild" = true ] && echo "配方同 $RECIPE_TAG，重新构建" || echo "配方与 $RECIPE_TAG 不同，用原包")" \
+              "$([ "$docker" = true ] && echo "按发布时的配方构建" || echo "上游没发过镜像，跳过")" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "info=$info" >> "$GITHUB_OUTPUT"
+          echo "docker_tags=$(jq -cn '$ARGS.positional' --args "${docker_tags[@]}")" >> "$GITHUB_OUTPUT"
+          jq . <<<"$info"
+
+      - name: 用各 tag 自己的脚本重新生成说明
+        env:
+          TAGS: ${{ steps.resolve.outputs.tags }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/notes"
+          echo "说明里的链接指向 \`$LINK_REPO\`" >> "$GITHUB_STEP_SUMMARY"
+          for t in $(jq -r '.[]' <<<"$TAGS"); do
+            script="$RUNNER_TEMP/gen-notes-$t.sh"
+            git show "$t:.github/workflows/release.yml" \
+              | yq '.jobs.release.steps[] | select(.name == "Generate release note") | .run' > "$script"
+            if [ ! -s "$script" ]; then
+              echo "::error::$t 的 release.yml 里没有 Generate release note 步骤，需要手工准备说明"
+              exit 1
+            fi
+            if grep -qF '$''{{' "$script"; then
+              echo "::error::$t 的说明脚本里用了 Actions 表达式，写法和 v1.10 之后不同，需要手工处理"
+              exit 1
+            fi
+            rm -f release-notes.md
+            GITHUB_REF_NAME="$t" GITHUB_REPOSITORY="$LINK_REPO" \
+              bash --noprofile --norc -eo pipefail "$script"
+            mv release-notes.md "$RUNNER_TEMP/notes/$t.md"
+            {
+              echo
+              echo "<details><summary>$t 的说明</summary>"
+              echo
+              cat "$RUNNER_TEMP/notes/$t.md"
+              echo
+              echo "</details>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: 只改已有 Release 的说明
+        if: inputs.mode == 'notes-only'
+        env:
+          TAGS: ${{ steps.resolve.outputs.tags }}
+        run: |
+          for t in $(jq -r '.[]' <<<"$TAGS"); do
+            gh release edit "$t" --notes-file "$RUNNER_TEMP/notes/$t.md"
+            echo "已更新 $t 的说明"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: notes
+          path: ${{ runner.temp }}/notes/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build:
+    name: 运行包 ${{ matrix.tag }} ${{ matrix.target.name }}
+    needs: prepare
+    if: inputs.mode == 'full' && needs.prepare.outputs.tags != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.tags) }}
+        target:
+          - { name: win-x64, os: windows-latest, triple: win32-x64, ext: .zip }
+          - { name: linux-x64, os: ubuntu-latest, triple: linux-x64, ext: .tar.gz }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, triple: linux-arm64, ext: .tar.gz }
+    runs-on: ${{ matrix.target.os }}
+    env:
+      TAG: ${{ matrix.tag }}
+      NAME: ${{ matrix.target.name }}
+      EXT: ${{ matrix.target.ext }}
+      REBUILD: ${{ inputs.rebuild }}
+      # 配方和 RECIPE_TAG 一致才重建
+      CAN_REBUILD: ${{ inputs.rebuild && fromJSON(needs.prepare.outputs.info)[matrix.tag].rebuild }}
+      PNPM_VERSION: ${{ fromJSON(needs.prepare.outputs.info)[matrix.tag].pnpm }}
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 准备构建目录（Linux）
+        if: env.CAN_REBUILD == 'true' && runner.os == 'Linux'
+        run: |
+          dir="$(dirname "$(dirname "$GITHUB_WORKSPACE")")/$UPSTREAM_NAME/$UPSTREAM_NAME"
+          mkdir -p "$dir"
+          echo "BUILD_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: 准备构建目录（Windows）
+        if: env.CAN_REBUILD == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        run: |
+          $ws   = $env:GITHUB_WORKSPACE
+          $root = Split-Path (Split-Path $ws)
+          $name = $env:UPSTREAM_NAME
+          $want = Join-Path $root "$name\$name"
+          function Set-Case([string]$path, [string]$newName) {
+            $item = Get-Item -LiteralPath $path
+            if ($item.Name -cne $newName) {
+              Rename-Item -LiteralPath $item.FullName -NewName "$newName.case-tmp"
+              Rename-Item -LiteralPath (Join-Path $item.Parent.FullName "$newName.case-tmp") -NewName $newName
+            }
+          }
+          try {
+            if ($ws -ieq $want) {
+              # fork 名和上游只差大小写。Windows 不区分大小写，把两级目录改成上游的写法，
+              # 默认工作目录照样能用
+              Set-Case (Split-Path $ws) $name
+              Set-Case (Join-Path $root "$name\$(Split-Path $ws -Leaf)") $name
+            } else {
+              New-Item -ItemType Directory -Force -Path $want | Out-Null
+            }
+          } catch {
+            Write-Output "::warning::没能准备 $want（$_），改在默认目录构建。功能不受影响，只是生成函数的名字会和原包不同"
+            $want = $ws
+          }
+          "BUILD_DIR=$($want -replace '\\', '/')" >> $env:GITHUB_ENV
+
+      - name: 检出 ${{ matrix.tag }} 源码
+        id: clone
+        if: env.CAN_REBUILD == 'true'
+        continue-on-error: true
+        run: |
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git -c advice.detachedHead=false \
+            -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            clone --quiet --depth 1 --branch "$TAG" "https://github.com/$GITHUB_REPOSITORY.git" "$BUILD_DIR"
+          cd "$BUILD_DIR"
+          # 同 release.yml：Node 用 node-version-file（.node-version），pnpm 用它写明的版本
+          node_version="$(tr -d '[:space:]' < .node-version)"
+          echo "Node $node_version，pnpm $PNPM_VERSION，在 $BUILD_DIR 构建"
+          [ -n "$node_version" ] && [ -n "$PNPM_VERSION" ]
+          echo "node=$node_version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup pnpm
+        id: pnpm
+        if: steps.clone.outcome == 'success'
+        continue-on-error: true
+        uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+          run_install: false
+
+      - name: Setup Node.js
+        id: node
+        if: steps.pnpm.outcome == 'success'
+        continue-on-error: true
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ steps.clone.outputs.node }}
+
+      # 仓库 .npmrc 用的是 npmmirror；装不上就换官方源重试，锁文件里的校验值不变，装到的包相同
+      - name: 构建（Windows，同 release.yml）
+        id: build_windows
+        if: steps.node.outcome == 'success' && runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        working-directory: ${{ env.BUILD_DIR }}
+        env:
+          SNOWLUMA_TARGET: ${{ matrix.target.triple }}
+        run: |
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::warning::按 .npmrc 的源安装失败，改用 registry.npmjs.org 重试"
+            pnpm install --frozen-lockfile --registry=https://registry.npmjs.org/
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          pnpm run build:all
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          pnpm check:release-layout
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 构建（Linux，同 release.yml）
+        id: build_linux
+        if: steps.node.outcome == 'success' && runner.os == 'Linux'
+        continue-on-error: true
+        working-directory: ${{ env.BUILD_DIR }}
+        env:
+          SNOWLUMA_TARGET: ${{ matrix.target.triple }}
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            echo "::warning::按 .npmrc 的源安装失败，改用 registry.npmjs.org 重试"
+            pnpm install --frozen-lockfile --registry=https://registry.npmjs.org/
+          fi
+          pnpm run build:all
+          pnpm check:release-layout
+
+      - name: 打包（Windows，同 release.yml）
+        id: pkg_windows
+        if: steps.build_windows.outcome == 'success'
+        continue-on-error: true
+        shell: pwsh
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          Compress-Archive -Path "dist\*" -DestinationPath "SnowLuma-$env:TAG-$env:NAME-lite.zip"
+          Copy-Item (Get-Command node).Source -Destination "dist\node.exe"
+          Compress-Archive -Path "dist\*" -DestinationPath "SnowLuma-$env:TAG-$env:NAME.zip"
+
+      - name: 打包（Linux，同 release.yml）
+        id: pkg_linux
+        if: steps.build_linux.outcome == 'success'
+        continue-on-error: true
+        working-directory: ${{ env.BUILD_DIR }}
+        run: |
+          chmod +x dist/launcher.sh
+          tar -czf "SnowLuma-$TAG-$NAME-lite.tar.gz" -C dist .
+          cp "$(command -v node)" dist/node
+          chmod +x dist/node
+          tar -czf "SnowLuma-$TAG-$NAME.tar.gz" -C dist .
+
+      - name: 收集文件（构建失败或不重建时拉原包）
+        env:
+          BUILT: ${{ steps.pkg_windows.outcome == 'success' || steps.pkg_linux.outcome == 'success' }}
+        run: |
+          mkdir -p out
+          files=("SnowLuma-$TAG-$NAME$EXT" "SnowLuma-$TAG-$NAME-lite$EXT")
+          if [ "$BUILT" = true ]; then
+            for f in "${files[@]}"; do mv "$BUILD_DIR/$f" out/; done
+            how="重新构建"
+          else
+            if [ "$CAN_REBUILD" = true ]; then
+              echo "::warning::$TAG $NAME 构建失败，改用原包"
+            elif [ "$REBUILD" = true ]; then
+              echo "::notice::$TAG 的构建步骤和 $RECIPE_TAG 不同，不重建，用原包"
+            fi
+            for f in "${files[@]}"; do
+              found=
+              for repo in $SOURCE_REPOS; do
+                if gh release download "$TAG" -R "$repo" -p "$f" -D out --clobber; then
+                  found="$repo"
+                  break
+                fi
+              done
+              if [ -z "$found" ]; then
+                echo "::error::$f 没有可用的来源：构建失败，$SOURCE_REPOS 里也没有原包"
+                exit 1
+              fi
+            done
+            how="原包（$found）"
+          fi
+          ls -l out
+          echo "**$TAG $NAME**：$how" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: assets-${{ matrix.tag }}-${{ matrix.target.name }}
+          path: out/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: 发布 ${{ matrix.tag }}
+    needs: [prepare, build]
+    if: ${{ !cancelled() && inputs.mode == 'full' && needs.prepare.outputs.tags != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.tags) }}
+    env:
+      TAG: ${{ matrix.tag }}
+      LATEST: ${{ needs.prepare.outputs.latest }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: notes
+          path: notes
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: assets-${{ matrix.tag }}-*
+          path: release
+          merge-multiple: true
+
+      - name: 创建或更新 Release
+        run: |
+          ls -l release
+          n="$(find release -type f | wc -l)"
+          if [ "$n" -ne 6 ]; then
+            echo "::error::$TAG 只拿到 $n 个运行包（应为 6 个），不发布。看上面哪个构建任务失败了"
+            exit 1
+          fi
+          make_latest=false
+          if [ "$TAG" = "$LATEST" ]; then make_latest=true; fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file "notes/$TAG.md" --latest="$make_latest"
+            gh release upload "$TAG" release/* --clobber
+          else
+            extra=()
+            if [[ "$TAG" == *-* ]]; then extra+=(--prerelease); fi
+            gh release create "$TAG" release/* --verify-tag --title "$TAG" \
+              --notes-file "notes/$TAG.md" --latest="$make_latest" "${extra[@]}"
+          fi
+
+  docker:
+    name: Docker ${{ matrix.tag }} ${{ matrix.arch }}
+    needs: [prepare, publish]
+    if: ${{ !cancelled() && inputs.mode == 'full' && needs.prepare.outputs.docker_tags != '[]' }}
+    # 同上游：两个架构各在原生运行器上构建
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.docker_tags) }}
+        arch: [amd64, arm64]
+    env:
+      TAG: ${{ matrix.tag }}
+      ARCH: ${{ matrix.arch }}
+      TAG_TIME: ${{ fromJSON(needs.prepare.outputs.info)[matrix.tag].time }}
+      REBUILD: ${{ inputs.rebuild }}
+      PUSH_GHCR: ${{ inputs.push_ghcr }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: 检查 Release
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::$TAG 的 Release 没有建成，跳过 Docker 镜像"
+            exit 1
+          fi
+          case "$ARCH" in
+            amd64) asset_arch=linux-x64 ;;
+            arm64) asset_arch=linux-arm64 ;;
+          esac
+          {
+            echo "IMAGE=${GHCR_IMAGE,,}"
+            echo "TAR=SnowLuma-$TAG-docker-$ARCH.tar"
+            echo "LITE=SnowLuma-$TAG-$asset_arch-lite.tar.gz"
+            echo "DIGESTS=$RUNNER_TEMP/digests"
+            echo "ORIGINAL=$RUNNER_TEMP/original"
+          } >> "$GITHUB_ENV"
+
+      # 先取原 tar：读出原镜像的 Node 版本，构建失败时也直接用它
+      - name: 取原 tar
+        id: original
+        run: |
+          mkdir -p "$ORIGINAL"
+          for repo in $SOURCE_REPOS; do
+            if gh release download "$TAG" -R "$repo" -p "$TAR" -D "$ORIGINAL" --clobber \
+               && tar -tf "$ORIGINAL/$TAR" manifest.json >/dev/null 2>&1; then
+              config="$(tar -xOf "$ORIGINAL/$TAR" manifest.json | jq -r '.[0].Config')"
+              node="$(tar -xOf "$ORIGINAL/$TAR" "$config" \
+                | jq -r '.config.Env[] | select(startswith("NODE_VERSION=")) | ltrimstr("NODE_VERSION=")' | head -n 1)"
+              echo "repo=$repo" >> "$GITHUB_OUTPUT"
+              echo "node=$node" >> "$GITHUB_OUTPUT"
+              echo "原 tar 来自 $repo，原镜像的 Node 是 ${node:-（未知）}"
+              exit 0
+            fi
+            rm -f "${ORIGINAL:?}/$TAR"
+          done
+          echo "::notice::$SOURCE_REPOS 里没有 $TAG 的原 tar"
+
+      - name: 检出 Docker 构建配方
+        id: framework
+        if: inputs.rebuild
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.DOCKER_FRAMEWORK_REPO }}
+          path: docker-framework
+          fetch-depth: 0
+          persist-credentials: false
+
+      # 上游发版时触发的是 Docker 仓库 main 上的 docker-image.yml，取那一刻 main 上的提交
+      - name: 选该版本发布时的配方
+        id: recipe
+        if: steps.framework.outcome == 'success'
+        continue-on-error: true
+        working-directory: docker-framework
+        run: |
+          ref="$(git rev-list -1 --first-parent --before="$((TAG_TIME + DOCKER_DISPATCH_WINDOW))" "$DOCKER_UPSTREAM_HEAD")"
+          if [ -z "$ref" ]; then
+            echo "::error::上游 main 上找不到 $TAG 发布之前的提交"
+            exit 1
+          fi
+          # 只认“从 Release 取 Lite 包”的配方（2026-05-09 起都是）
+          if ! git show "$ref:.github/workflows/docker-image.yml" | grep -q 'snowluma_tag:'; then
+            echo "::error::$ref 的配方不是从 Release 取 Lite 包，和上游发版时的做法对不上"
+            exit 1
+          fi
+          git checkout -q --detach "$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          git log -1 --format='配方：%h %cI %s' "$ref"
+
+      # 同上游 docker-image.yml：从 Release 取对应架构的 Lite 包
+      - name: 取 Lite 包
+        id: lite
+        if: steps.recipe.outcome == 'success'
+        continue-on-error: true
+        run: |
+          gh release download "$TAG" -p "$LITE" --output docker-framework/SnowLuma.Framework.tar.gz --clobber
+          ls -lh docker-framework/SnowLuma.Framework.tar.gz
+
+      - name: Set up Docker buildx
+        id: buildx
+        if: steps.lite.outcome == 'success'
+        continue-on-error: true
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: inputs.push_ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: 构建镜像（同上游 docker-image.yml）
+        id: build
+        if: steps.buildx.outcome == 'success'
+        continue-on-error: true
+        working-directory: docker-framework
+        env:
+          NODE_PIN: ${{ steps.original.outputs.node }}
+        run: |
+          args=()
+          if [ -n "$NODE_PIN" ]; then
+            # 基础镜像 node:<版本>-bookworm-slim 的 Node 版本和原镜像一致
+            args+=(--build-arg "NODE_VERSION=$NODE_PIN")
+          else
+            echo "::notice::没有原镜像可参照，基础镜像按 Dockerfile 默认，会取到现在最新的版本"
+          fi
+          rm -rf "$DIGESTS" && mkdir -p "$DIGESTS"
+          if [ "$PUSH_GHCR" = true ]; then
+            # 和上游一样按摘要推送，最后由 ghcr 任务合成多架构清单
+            docker buildx build \
+              --platform "linux/$ARCH" \
+              --tag "$IMAGE" \
+              --file ./Dockerfile \
+              "${args[@]}" \
+              --output "type=image,push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file metadata.json \
+              .
+            digest="$(jq -r '."containerimage.digest"' metadata.json)"
+            if [ -z "$digest" ] || [ "$digest" = null ]; then
+              echo "::error::拿不到推送后的镜像摘要"
+              cat metadata.json
+              exit 1
+            fi
+            touch "$DIGESTS/${digest#sha256:}"
+          fi
+          # 用同一份构建缓存再导出一次，得到 docker load 能直接导入的 tar
+          docker buildx build \
+            --platform "linux/$ARCH" \
+            --file ./Dockerfile \
+            "${args[@]}" \
+            --provenance=false \
+            --output "type=docker,dest=$GITHUB_WORKSPACE/$TAR,name=$IMAGE:$TAG" \
+            .
+          tar -tf "$GITHUB_WORKSPACE/$TAR" manifest.json >/dev/null
+
+      - name: 构建失败或不重建时用原 tar
+        if: steps.build.outcome != 'success'
+        env:
+          FOUND: ${{ steps.original.outputs.repo }}
+        run: |
+          if [ -z "$FOUND" ]; then
+            echo "::error::$TAR 没有可用的来源：没能重新构建，$SOURCE_REPOS 里也没有原 tar"
+            exit 1
+          fi
+          if [ "$REBUILD" = true ]; then
+            echo "::warning::$TAG docker-$ARCH 没能重新构建，改用原 tar"
+          fi
+          rm -rf "$DIGESTS" && mkdir -p "$DIGESTS"
+          mv -f "$ORIGINAL/$TAR" "$TAR"
+          if [ "$PUSH_GHCR" = true ]; then
+            # 原 tar 也推到 GHCR：导入后打上单架构标签推送，再记下摘要用来合成清单
+            loaded="$(docker load -i "$TAR" | sed -n 's/^Loaded image: //p' | head -n 1)"
+            docker tag "$loaded" "$IMAGE:$TAG-$ARCH"
+            docker push "$IMAGE:$TAG-$ARCH"
+            digest="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$TAG-$ARCH" \
+              | sed -n "s|^$IMAGE@||p" | head -n 1)"
+            touch "$DIGESTS/${digest#sha256:}"
+          fi
+
+      - name: 上传到 Release
+        env:
+          HOW: ${{ steps.build.outcome == 'success' && format('重新构建（配方 {0}，Node {1}）', steps.recipe.outputs.ref, steps.original.outputs.node || 'Dockerfile 默认') || format('原 tar（{0}）', steps.original.outputs.repo) }}
+        run: |
+          ls -l "$TAR"
+          sha256sum "$TAR"
+          gh release upload "$TAG" "$TAR" --clobber
+          echo "**$TAG docker-$ARCH**：$HOW" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: inputs.push_ghcr
+        with:
+          name: ghcr-digest-${{ matrix.tag }}-${{ matrix.arch }}
+          path: ${{ env.DIGESTS }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+  ghcr:
+    name: GHCR ${{ matrix.tag }}
+    needs: [prepare, docker]
+    if: ${{ !cancelled() && inputs.mode == 'full' && inputs.push_ghcr && needs.prepare.outputs.docker_tags != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJSON(needs.prepare.outputs.docker_tags) }}
+    env:
+      TAG: ${{ matrix.tag }}
+      LATEST: ${{ needs.prepare.outputs.latest }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: ghcr-digest-${{ matrix.tag }}-*
+          path: digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: 合成多架构镜像并打标签
+        run: |
+          image="${GHCR_IMAGE,,}"
+          shopt -s nullglob
+          files=(digests/*)
+          if [ "${#files[@]}" -ne 2 ]; then
+            echo "::error::$TAG 只拿到 ${#files[@]} 个架构的镜像（应为 amd64 + arm64），不合成。看上面哪个 Docker 任务失败了"
+            exit 1
+          fi
+          refs=()
+          for f in "${files[@]}"; do refs+=("$image@sha256:$(basename "$f")"); done
+          tags=(--tag "$image:$TAG")
+          if [ "$TAG" = "$LATEST" ]; then tags+=(--tag "$image:latest"); fi
+          docker buildx imagetools create "${tags[@]}" "${refs[@]}"
+          docker buildx imagetools inspect "$image:$TAG"
+          {
+            echo "**GHCR**：\`docker pull $image:$TAG\`"
+            if [ "$TAG" = "$LATEST" ]; then echo "（同时更新了 \`latest\`）"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
